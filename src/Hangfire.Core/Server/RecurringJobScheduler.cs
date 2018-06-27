@@ -66,7 +66,7 @@ namespace Hangfire.Server
     public class RecurringJobScheduler : IBackgroundProcess
     {
         private static readonly TimeSpan LockTimeout = TimeSpan.FromMinutes(1);
-        private static readonly ILog Logger = LogProvider.GetCurrentClassLogger();
+        private static readonly ILog Logger = LogProvider.For<RecurringJobScheduler>();
         
         private readonly IBackgroundJobFactory _factory;
         private readonly Func<CrontabSchedule, TimeZoneInfo, IScheduleInstant> _instantFactory;
@@ -98,9 +98,9 @@ namespace Hangfire.Server
             [NotNull] Func<CrontabSchedule, TimeZoneInfo, IScheduleInstant> instantFactory,
             [NotNull] IThrottler throttler)
         {
-            if (factory == null) throw new ArgumentNullException("factory");
-            if (instantFactory == null) throw new ArgumentNullException("instantFactory");
-            if (throttler == null) throw new ArgumentNullException("throttler");
+            if (factory == null) throw new ArgumentNullException(nameof(factory));
+            if (instantFactory == null) throw new ArgumentNullException(nameof(instantFactory));
+            if (throttler == null) throw new ArgumentNullException(nameof(throttler));
             
             _factory = factory;
             _instantFactory = instantFactory;
@@ -110,19 +110,18 @@ namespace Hangfire.Server
         /// <inheritdoc />
         public void Execute(BackgroundProcessContext context)
         {
-            if (context == null) throw new ArgumentNullException("context");
+            if (context == null) throw new ArgumentNullException(nameof(context));
 
             _throttler.Throttle(context.CancellationToken);
 
-            using (var connection = context.Storage.GetConnection())
-            using (connection.AcquireDistributedLock("recurring-jobs:lock", LockTimeout))
+            UseConnectionDistributedLock(context.Storage, connection =>
             {
                 var recurringJobIds = connection.GetAllItemsFromSet("recurring-jobs");
 
                 foreach (var recurringJobId in recurringJobIds)
                 {
                     var recurringJob = connection.GetAllEntriesFromHash(
-                        String.Format("recurring-job:{0}", recurringJobId));
+                        $"recurring-job:{recurringJobId}");
 
                     if (recurringJob == null)
                     {
@@ -136,15 +135,15 @@ namespace Hangfire.Server
                     catch (JobLoadException ex)
                     {
                         Logger.WarnException(
-                            String.Format(
-                                "Recurring job '{0}' can not be scheduled due to job load exception.",
-                                recurringJobId),
+                            $"Recurring job '{recurringJobId}' can not be scheduled due to job load exception.",
                             ex);
                     }
                 }
+            });
 
-                _throttler.Delay(context.CancellationToken);
-            }
+            // The code above may be completed in less than a second. Default throttler use
+            // the second resolution, and without an extra delay, CPU and DB bursts may happen.
+            _throttler.Delay(context.CancellationToken);
         }
 
         /// <inheritdoc />
@@ -185,15 +184,13 @@ namespace Hangfire.Server
 
                     var context = new CreateContext(storage, connection, job, state);
                     context.Parameters["RecurringJobId"] = recurringJobId;
+
                     var backgroundJob = _factory.Create(context);
-                    var jobId = backgroundJob != null ? backgroundJob.Id : null;
+                    var jobId = backgroundJob?.Id;
 
                     if (String.IsNullOrEmpty(jobId))
                     {
-                        Logger.DebugFormat(
-                            "Recurring job '{0}' execution at '{1}' has been canceled.",
-                            recurringJobId,
-                            nowInstant.NowInstant);
+                        Logger.Debug($"Recurring job '{recurringJobId}' execution at '{nowInstant.NowInstant}' has been canceled.");
                     }
 
                     changedFields.Add("LastExecution", JobHelper.SerializeDateTime(nowInstant.NowInstant));
@@ -209,14 +206,45 @@ namespace Hangfire.Server
                 changedFields.Add("NextExecution", nowInstant.NextInstant.HasValue ? JobHelper.SerializeDateTime(nowInstant.NextInstant.Value) : null);
 
                 connection.SetRangeInHash(
-                    String.Format("recurring-job:{0}", recurringJobId),
+                    $"recurring-job:{recurringJobId}",
                     changedFields);
             }
+#if NETFULL
             catch (TimeZoneNotFoundException ex)
             {
+#else
+            catch (Exception ex)
+            {
+                // https://github.com/dotnet/corefx/issues/7552
+                if (!ex.GetType().Name.Equals("TimeZoneNotFoundException")) throw;
+#endif
+
                 Logger.ErrorException(
-                    String.Format("Recurring job '{0}' was not triggered: {1}.", recurringJobId, ex.Message),
+                    $"Recurring job '{recurringJobId}' was not triggered: {ex.Message}.",
                     ex);
+            }
+
+        }
+
+        private void UseConnectionDistributedLock(JobStorage storage, Action<IStorageConnection> action)
+        {
+            var resource = "recurring-jobs:lock";
+            try
+            {
+                using (var connection = storage.GetConnection())
+                using (connection.AcquireDistributedLock(resource, LockTimeout))
+                {
+                    action(connection);
+                }
+            }
+            catch (DistributedLockTimeoutException e) when (e.Resource == resource)
+            {
+                // DistributedLockTimeoutException here doesn't mean that recurring jobs weren't scheduled.
+                // It just means another Hangfire server did this work.
+                Logger.Log(
+                    LogLevel.Debug,
+                    () => $@"An exception was thrown during acquiring distributed lock the {resource} resource within {LockTimeout.TotalSeconds} seconds. The recurring jobs have not been handled this time.",
+                    e);
             }
         }
 

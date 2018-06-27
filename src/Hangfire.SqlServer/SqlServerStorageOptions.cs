@@ -15,7 +15,11 @@
 // License along with Hangfire. If not, see <http://www.gnu.org/licenses/>.
 
 using System;
+#if NETFULL
 using System.Transactions;
+#else
+using System.Data;
+#endif
 
 namespace Hangfire.SqlServer
 {
@@ -23,16 +27,20 @@ namespace Hangfire.SqlServer
     {
         private TimeSpan _queuePollInterval;
         private string _schemaName;
+        private TimeSpan? _slidingInvisibilityTimeout;
 
         public SqlServerStorageOptions()
         {
             TransactionIsolationLevel = null;
             QueuePollInterval = TimeSpan.FromSeconds(15);
+            SlidingInvisibilityTimeout = null;
+#pragma warning disable 618
             InvisibilityTimeout = TimeSpan.FromMinutes(30);
-            JobExpirationCheckInterval = TimeSpan.FromHours(1);
+#pragma warning restore 618
+            JobExpirationCheckInterval = TimeSpan.FromMinutes(30);
             CountersAggregateInterval = TimeSpan.FromMinutes(5);
             PrepareSchemaIfNecessary = true;
-            DashboardJobListLimit = 50000;
+            DashboardJobListLimit = 10000;
             _schemaName = Constants.DefaultSchema;
             TransactionTimeout = TimeSpan.FromMinutes(1);
         }
@@ -44,17 +52,15 @@ namespace Hangfire.SqlServer
             get { return _queuePollInterval; }
             set
             {
-                var message = String.Format(
-                    "The QueuePollInterval property value should be positive. Given: {0}.",
-                    value);
+                var message = $"The QueuePollInterval property value should be positive. Given: {value}.";
 
                 if (value == TimeSpan.Zero)
                 {
-                    throw new ArgumentException(message, "value");
+                    throw new ArgumentException(message, nameof(value));
                 }
                 if (value != value.Duration())
                 {
-                    throw new ArgumentException(message, "value");
+                    throw new ArgumentException(message, nameof(value));
                 }
 
                 _queuePollInterval = value;
@@ -64,6 +70,20 @@ namespace Hangfire.SqlServer
         [Obsolete("Does not make sense anymore. Background jobs re-queued instantly even after ungraceful shutdown now. Will be removed in 2.0.0.")]
         public TimeSpan InvisibilityTimeout { get; set; }
 
+        public TimeSpan? SlidingInvisibilityTimeout
+        {
+            get { return _slidingInvisibilityTimeout; }
+            set
+            {
+                if (value <= TimeSpan.Zero)
+                {
+                    throw new ArgumentOutOfRangeException("Sliding timeout should be greater than zero");
+                }
+
+                _slidingInvisibilityTimeout = value;
+            }
+        }
+
         public bool PrepareSchemaIfNecessary { get; set; }
 
         public TimeSpan JobExpirationCheckInterval { get; set; }
@@ -71,6 +91,8 @@ namespace Hangfire.SqlServer
 
         public int? DashboardJobListLimit { get; set; }
         public TimeSpan TransactionTimeout { get; set; }
+        public TimeSpan? CommandTimeout { get; set; }
+        public TimeSpan? CommandBatchMaxTimeout { get; set; }
 
         public string SchemaName
         {
@@ -79,7 +101,7 @@ namespace Hangfire.SqlServer
             {
                 if (string.IsNullOrWhiteSpace(_schemaName))
                 {
-                    throw new ArgumentException(_schemaName, "value");
+                    throw new ArgumentException(_schemaName, nameof(value));
                 }
                 _schemaName = value;
             }

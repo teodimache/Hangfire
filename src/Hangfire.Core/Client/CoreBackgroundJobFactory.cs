@@ -28,7 +28,7 @@ namespace Hangfire.Client
 
         public CoreBackgroundJobFactory([NotNull] IStateMachine stateMachine)
         {
-            if (stateMachine == null) throw new ArgumentNullException("stateMachine");
+            if (stateMachine == null) throw new ArgumentNullException(nameof(stateMachine));
             _stateMachine = stateMachine;
         }
 
@@ -41,7 +41,7 @@ namespace Hangfire.Client
                 context.Job,
                 parameters,
                 createdAt,
-                TimeSpan.FromHours(1));
+                TimeSpan.FromDays(30));
 
             var backgroundJob = new BackgroundJob(jobId, context.Job, createdAt);
 

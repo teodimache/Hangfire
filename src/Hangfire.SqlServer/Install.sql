@@ -15,12 +15,17 @@
 -- License along with Hangfire. If not, see <http://www.gnu.org/licenses/>.
 
 SET NOCOUNT ON
+SET XACT_ABORT ON
 DECLARE @TARGET_SCHEMA_VERSION INT;
 SET @TARGET_SCHEMA_VERSION = 5;
 
 PRINT 'Installing Hangfire SQL objects...';
 
 BEGIN TRANSACTION;
+
+-- Acquire exclusive lock to prevent deadlocks caused by schema creation / version update
+DECLARE @SchemaLockResult INT;
+EXEC @SchemaLockResult = sp_getapplock @Resource = '$(HangFireSchema):SchemaLock', @LockMode = 'Exclusive'
 
 -- Create the database schema if it doesn't exists
 IF NOT EXISTS (SELECT [schema_id] FROM [sys].[schemas] WHERE [name] = '$(HangFireSchema)')
@@ -55,7 +60,7 @@ PRINT 'Current Hangfire schema version: ' + CASE @CURRENT_SCHEMA_VERSION WHEN NU
 IF @CURRENT_SCHEMA_VERSION IS NOT NULL AND @CURRENT_SCHEMA_VERSION > @TARGET_SCHEMA_VERSION
 BEGIN
     ROLLBACK TRANSACTION;
-    RAISERROR(N'HangFire current database schema version %d is newer than the configured SqlServerStorage schema version %d. Please update to the latest HangFire.SqlServer NuGet package.', 11, 1,
+    RAISERROR(N'Hangfire current database schema version %d is newer than the configured SqlServerStorage schema version %d. Please update to the latest Hangfire.SqlServer NuGet package.', 11, 1,
         @CURRENT_SCHEMA_VERSION, @TARGET_SCHEMA_VERSION);
 END
 
@@ -359,10 +364,19 @@ BEGIN
         [FetchedAt] ASC
     );
     PRINT 'Re-created index [IX_HangFire_JobQueue_QueueAndFetchedAt]';
-		
+
+	ALTER TABLE [$(HangFireSchema)].[Server] DROP CONSTRAINT [PK_HangFire_Server]
+    PRINT 'Dropped constraint [PK_HangFire_Server] to modify the [HangFire].[Server].[Id] column';
+
 	ALTER TABLE [$(HangFireSchema)].[Server] ALTER COLUMN [Id] NVARCHAR (100) NOT NULL;
 	PRINT 'Modified [$(HangFireSchema)].[Server].[Id] length to 100';
-		
+
+	ALTER TABLE [$(HangFireSchema)].[Server] ADD  CONSTRAINT [PK_HangFire_Server] PRIMARY KEY CLUSTERED
+	(
+		[Id] ASC
+	);
+	PRINT 'Re-created constraint [PK_HangFire_Server]';
+
 	SET @CURRENT_SCHEMA_VERSION = 5;
 END
 	

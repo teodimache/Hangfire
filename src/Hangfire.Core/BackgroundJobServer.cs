@@ -23,15 +23,16 @@ using Hangfire.Common;
 using Hangfire.Logging;
 using Hangfire.Server;
 using Hangfire.States;
+using System.ComponentModel;
 
 namespace Hangfire
 {
     public class BackgroundJobServer : IDisposable
     {
-        private static readonly ILog Logger = LogProvider.GetCurrentClassLogger();
+        private static readonly ILog Logger = LogProvider.For<BackgroundJobServer>();
 
         private readonly BackgroundJobServerOptions _options;
-        private readonly IDisposable _processingServer;
+        private readonly BackgroundProcessingServer _processingServer;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BackgroundJobServer"/> class
@@ -77,15 +78,34 @@ namespace Hangfire
             [NotNull] BackgroundJobServerOptions options,
             [NotNull] JobStorage storage,
             [NotNull] IEnumerable<IBackgroundProcess> additionalProcesses)
+            : this(options, storage, additionalProcesses, 
+                   options.FilterProvider ?? JobFilterProviders.Providers,
+                   options.Activator ?? JobActivator.Current, 
+                   null, null, null)
         {
-            if (storage == null) throw new ArgumentNullException("storage");
-            if (options == null) throw new ArgumentNullException("options");
-            if (additionalProcesses == null) throw new ArgumentNullException("additionalProcesses");
+        }
+
+        [EditorBrowsable(EditorBrowsableState.Advanced)]
+        public BackgroundJobServer(
+            [NotNull] BackgroundJobServerOptions options,
+            [NotNull] JobStorage storage,
+            [NotNull] IEnumerable<IBackgroundProcess> additionalProcesses,
+            [NotNull] IJobFilterProvider filterProvider,
+            [NotNull] JobActivator activator,
+            [CanBeNull] IBackgroundJobFactory factory,
+            [CanBeNull] IBackgroundJobPerformer performer,
+            [CanBeNull] IBackgroundJobStateChanger stateChanger)
+        {
+            if (storage == null) throw new ArgumentNullException(nameof(storage));
+            if (options == null) throw new ArgumentNullException(nameof(options));
+            if (additionalProcesses == null) throw new ArgumentNullException(nameof(additionalProcesses));
+            if (filterProvider == null) throw new ArgumentNullException(nameof(filterProvider));
+            if (activator == null) throw new ArgumentNullException(nameof(activator));
 
             _options = options;
 
             var processes = new List<IBackgroundProcess>();
-            processes.AddRange(GetRequiredProcesses());
+            processes.AddRange(GetRequiredProcesses(filterProvider, activator, factory, performer, stateChanger));
             processes.AddRange(additionalProcesses);
 
             var properties = new Dictionary<string, object>
@@ -95,15 +115,15 @@ namespace Hangfire
             };
 
             Logger.Info("Starting Hangfire Server");
-            Logger.InfoFormat("Using job storage: '{0}'.", storage);
+            Logger.Info($"Using job storage: '{storage}'");
 
             storage.WriteOptionsToLog(Logger);
 
             Logger.Info("Using the following options for Hangfire Server:");
-            Logger.InfoFormat("    Worker count: {0}.", options.WorkerCount);
-            Logger.InfoFormat("    Listening queues: {0}.", String.Join(", ", options.Queues.Select(x => "'" + x + "'")));
-            Logger.InfoFormat("    Shutdown timeout: {0}.", options.ShutdownTimeout);
-            Logger.InfoFormat("    Schedule polling interval: {0}.", options.SchedulePollingInterval);
+            Logger.Info($"    Worker count: {options.WorkerCount}");
+            Logger.Info($"    Listening queues: {String.Join(", ", options.Queues.Select(x => "'" + x + "'"))}");
+            Logger.Info($"    Shutdown timeout: {options.ShutdownTimeout}");
+            Logger.Info($"    Schedule polling interval: {options.SchedulePollingInterval}");
             
             _processingServer = new BackgroundProcessingServer(
                 storage, 
@@ -112,21 +132,30 @@ namespace Hangfire
                 GetProcessingServerOptions());
         }
 
+        public void SendStop()
+        {
+            Logger.Debug("Hangfire Server is stopping...");
+            _processingServer.SendStop();
+        }
+
         public void Dispose()
         {
             _processingServer.Dispose();
             Logger.Info("Hangfire Server stopped.");
         }
 
-        private IEnumerable<IBackgroundProcess> GetRequiredProcesses()
+        private IEnumerable<IBackgroundProcess> GetRequiredProcesses(
+            [NotNull] IJobFilterProvider filterProvider,
+            [NotNull] JobActivator activator,
+            [CanBeNull] IBackgroundJobFactory factory,
+            [CanBeNull] IBackgroundJobPerformer performer,
+            [CanBeNull] IBackgroundJobStateChanger stateChanger)
         {
             var processes = new List<IBackgroundProcess>();
-
-            var filterProvider = _options.FilterProvider ?? JobFilterProviders.Providers;
-
-            var factory = new BackgroundJobFactory(filterProvider);
-            var performer = new BackgroundJobPerformer(filterProvider, _options.Activator ?? JobActivator.Current);
-            var stateChanger = new BackgroundJobStateChanger(filterProvider);
+            
+            factory = factory ?? new BackgroundJobFactory(filterProvider);
+            performer = performer ?? new BackgroundJobPerformer(filterProvider, activator);
+            stateChanger = stateChanger ?? new BackgroundJobStateChanger(filterProvider);
             
             for (var i = 0; i < _options.WorkerCount; i++)
             {
@@ -145,12 +174,11 @@ namespace Hangfire
             {
                 ShutdownTimeout = _options.ShutdownTimeout,
                 HeartbeatInterval = _options.HeartbeatInterval,
-                ServerCheckInterval = _options.ServerWatchdogOptions != null
-                    ? _options.ServerWatchdogOptions.CheckInterval
-                    : _options.ServerCheckInterval,
-                ServerTimeout = _options.ServerWatchdogOptions != null
-                    ? _options.ServerWatchdogOptions.ServerTimeout
-                    : _options.ServerTimeout
+#pragma warning disable 618
+                ServerCheckInterval = _options.ServerWatchdogOptions?.CheckInterval ?? _options.ServerCheckInterval,
+                ServerTimeout = _options.ServerWatchdogOptions?.ServerTimeout ?? _options.ServerTimeout,
+                ServerName = _options.ServerName
+#pragma warning restore 618
             };
         }
 

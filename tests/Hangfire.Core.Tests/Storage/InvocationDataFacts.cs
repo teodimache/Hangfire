@@ -1,6 +1,11 @@
-﻿using Hangfire.Common;
+﻿using System;
+using System.Collections.Generic;
+using System.Reflection;
+using Hangfire.Common;
 using Hangfire.Storage;
+using Newtonsoft.Json;
 using Xunit;
+using System.Globalization;
 
 namespace Hangfire.Core.Tests.Storage
 {
@@ -81,7 +86,7 @@ namespace Hangfire.Core.Tests.Storage
 
             var job = serializedData.Deserialize();
 
-            Assert.False(job.Type.ContainsGenericParameters);
+            Assert.False(job.Type.GetTypeInfo().ContainsGenericParameters);
             Assert.Equal(typeof(string), job.Type.GetGenericArguments()[0]);
         }
 
@@ -102,7 +107,7 @@ namespace Hangfire.Core.Tests.Storage
             var serializedData = new InvocationData(
                 typeof(IParent).AssemblyQualifiedName,
                 "Method",
-                JobHelper.ToJson(new string[0]),
+                JobHelper.ToJson(new Type[0]),
                 JobHelper.ToJson(new string[0]));
 
             var job = serializedData.Deserialize();
@@ -116,7 +121,7 @@ namespace Hangfire.Core.Tests.Storage
             var serializedData = new InvocationData(
                 typeof(IChild).AssemblyQualifiedName,
                 "Method",
-                JobHelper.ToJson(new string[0]),
+                JobHelper.ToJson(new Type[0]),
                 JobHelper.ToJson(new string[0]));
 
             var job = serializedData.Deserialize();
@@ -124,7 +129,203 @@ namespace Hangfire.Core.Tests.Storage
             Assert.Equal(typeof(IChild), job.Type);
         }
 
+        [Fact]
+        public void Deserialize_RethrowsJsonException_InsteadOfNullValue_WhenReferenceConverterChosen()
+        {
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                "ListMethod",
+                JobHelper.ToJson(new [] { typeof(IList<string>) }),
+                JobHelper.ToJson(new [] { "asdfasdf" }));
+
+            var exception = Assert.Throws<JobLoadException>(() => serializedData.Deserialize());
+            Assert.IsType<JsonReaderException>(exception.InnerException);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_LocalDateTimeArguments_ConvertedToRoundtripFormat()
+        {
+            var value = DateTime.Now;
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(DateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime) }),
+                JobHelper.ToJson(new[] { value.ToString("o", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            Assert.Equal(value, (DateTime)job.Args[0]);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_UnknownDateTimeArguments_ConvertedToRoundtripFormat()
+        {
+            var value = new DateTime(2017, 1, 1, 1, 1, 1, 1, DateTimeKind.Unspecified);
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(DateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime) }),
+                JobHelper.ToJson(new[] { value.ToString("o", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            Assert.Equal(value, (DateTime)job.Args[0]);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_UtcDateTimeArguments_ConvertedToRoundtripFormat()
+        {
+            
+            var value = DateTime.UtcNow;
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(DateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime) }),
+                JobHelper.ToJson(new[] { value.ToString("o", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            Assert.Equal(value, (DateTime)job.Args[0]);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_LocalDateTimeArguments_ConvertedToOldFormat_WithLoweredPrecision()
+        {
+            var value = DateTime.Now;
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(DateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime) }),
+                JobHelper.ToJson(new[] { value.ToString("MM/dd/yyyy HH:mm:ss.ffff", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            var actualValue = (DateTime)job.Args[0];
+
+            Assert.Equal(value.Year, actualValue.Year);
+            Assert.Equal(value.Month, actualValue.Month);
+            Assert.Equal(value.Day, actualValue.Day);
+            Assert.Equal(value.Hour, actualValue.Hour);
+            Assert.Equal(value.Minute, actualValue.Minute);
+            Assert.Equal(value.Second, actualValue.Second);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_UnknownDateTimeArguments_ConvertedToOldFormat_WithLoweredPrecision()
+        {
+            var value = new DateTime(2017, 1, 1, 1, 1, 1, 1, DateTimeKind.Unspecified);
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(DateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime) }),
+                JobHelper.ToJson(new[] { value.ToString("MM/dd/yyyy HH:mm:ss.ffff", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            var actualValue = (DateTime)job.Args[0];
+
+            Assert.Equal(value.Year, actualValue.Year);
+            Assert.Equal(value.Month, actualValue.Month);
+            Assert.Equal(value.Day, actualValue.Day);
+            Assert.Equal(value.Hour, actualValue.Hour);
+            Assert.Equal(value.Minute, actualValue.Minute);
+            Assert.Equal(value.Second, actualValue.Second);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_UtcDateTimeArguments_ConvertedToOldFormat_WithLoweredPrecision()
+        {
+            var value = DateTime.UtcNow;
+
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(DateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime) }),
+                JobHelper.ToJson(new[] { value.ToString("MM/dd/yyyy HH:mm:ss.ffff", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            var actualValue = (DateTime)job.Args[0];
+
+            Assert.Equal(value.Year, actualValue.Year);
+            Assert.Equal(value.Month, actualValue.Month);
+            Assert.Equal(value.Day, actualValue.Day);
+            Assert.Equal(value.Hour, actualValue.Hour);
+            Assert.Equal(value.Minute, actualValue.Minute);
+            Assert.Equal(value.Second, actualValue.Second);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_NullableUtcDateTimeArguments()
+        {
+            DateTime? value = DateTime.UtcNow;
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(NullableDateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime?) }),
+                JobHelper.ToJson(new[] { value.Value.ToString("o", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            Assert.Equal(value, job.Args[0]);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlySeserializes_NullableUtcDateTimeArguments_With_Null()
+        {
+            DateTime? value = null;
+
+            var serializedData = InvocationData.Serialize(Job.FromExpression(() => NullableDateTimeMethod(value)));
+
+            var job = serializedData.Deserialize();
+
+            Assert.Equal(value, job.Args[0]);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_NullableLocalDateTimeArguments()
+        {
+            DateTime? value = DateTime.Now;
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(NullableDateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime?) }),
+                JobHelper.ToJson(new[] { value.Value.ToString("o", CultureInfo.InvariantCulture) }));
+
+            var job = serializedData.Deserialize();
+
+            Assert.Equal(value, job.Args[0]);
+        }
+
+        [Fact]
+        public void Deserialize_CorrectlyDeserializes_NullableDateTimeArguments_With_Null_Value()
+        {
+            DateTime? value = null;
+            var result = value is DateTime;
+            var serializedData = new InvocationData(
+                typeof(InvocationDataFacts).AssemblyQualifiedName,
+                nameof(NullableDateTimeMethod),
+                JobHelper.ToJson(new[] { typeof(DateTime?) }),
+                JobHelper.ToJson(new[] { value }));
+
+            var job = serializedData.Deserialize();
+
+            Assert.Equal(value, job.Args[0]);
+        }
+
         public static void Sample(string arg)
+        {
+        }
+
+        public static void ListMethod(IList<string> arg)
+        {
+        }
+
+        public static void DateTimeMethod(DateTime arg)
+        {
+        }
+
+        public static void NullableDateTimeMethod(DateTime? arg)
         {
         }
 

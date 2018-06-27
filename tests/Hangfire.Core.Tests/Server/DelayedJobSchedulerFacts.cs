@@ -7,6 +7,8 @@ using Hangfire.Storage;
 using Moq;
 using Xunit;
 
+// ReSharper disable AssignNullToNotNullAttribute
+
 namespace Hangfire.Core.Tests.Server
 {
     public class DelayedJobSchedulerFacts
@@ -101,6 +103,18 @@ namespace Hangfire.Core.Tests.Server
 
             _connection.Verify(x => x.AcquireDistributedLock(It.IsAny<string>(), It.IsAny<TimeSpan>()));
             _distributedLock.Verify(x => x.Dispose());
+        }
+
+        [Fact]
+        public void Execute_DoesNotThrowDistributedLockTimeoutException()
+        {
+            _connection
+                .Setup(x => x.AcquireDistributedLock("locks:schedulepoller", It.IsAny<TimeSpan>()))
+                .Throws(new DistributedLockTimeoutException("locks:schedulepoller"));
+
+            var scheduler = CreateScheduler();
+
+            scheduler.Execute(_context.Object);
         }
 
         private DelayedJobScheduler CreateScheduler()

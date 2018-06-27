@@ -1,11 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using Hangfire.Common;
 using Hangfire.States;
 using Hangfire.Storage;
 using Moq;
 using Xunit;
+
+// ReSharper disable AssignNullToNotNullAttribute
 
 namespace Hangfire.Core.Tests.States
 {
@@ -19,6 +22,7 @@ namespace Hangfire.Core.Tests.States
         private readonly Mock<IStorageConnection> _connection;
         private readonly Job _job;
         private readonly Mock<IState> _state;
+        private readonly Mock<IJobFilterProvider> _filterProvider;
         private readonly Mock<IStateMachine> _stateMachine;
         private readonly Mock<IDisposable> _distributedLock;
         private readonly Mock<IWriteOnlyTransaction> _transaction;
@@ -28,6 +32,8 @@ namespace Hangfire.Core.Tests.States
         public BackgroundJobStateChangerFacts()
         {
             _stateMachine = new Mock<IStateMachine>();
+            _filterProvider = new Mock<IJobFilterProvider>();
+            _filterProvider.Setup(x => x.GetFilters(It.IsAny<Job>())).Returns(Enumerable.Empty<JobFilter>());
 
             _job = Job.FromExpression(() => Console.WriteLine());
             _state = new Mock<IState>();
@@ -53,7 +59,7 @@ namespace Hangfire.Core.Tests.States
 
             _distributedLock = new Mock<IDisposable>();
             _connection
-                .Setup(x => x.AcquireDistributedLock(String.Format("job:{0}:state-lock", JobId), It.IsAny<TimeSpan>()))
+                .Setup(x => x.AcquireDistributedLock($"job:{JobId}:state-lock", It.IsAny<TimeSpan>()))
                 .Returns(_distributedLock.Object);
 
             _cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
@@ -69,12 +75,21 @@ namespace Hangfire.Core.Tests.States
             _stateMachine.Setup(x => x.ApplyState(It.IsNotNull<ApplyStateContext>()))
                 .Returns(_context.NewState.Object);
         }
+
+        [Fact]
+        public void Ctor_ThrowsAnException_WhenFilterProviderIsNull()
+        {
+            var exception = Assert.Throws<ArgumentNullException>(
+                () => new BackgroundJobStateChanger(null));
+
+            Assert.Equal("filterProvider", exception.ParamName);
+        }
         
         [Fact]
         public void Ctor_ThrowsAnException_WhenStateMachineNull()
         {
             var exception = Assert.Throws<ArgumentNullException>(
-                () => new BackgroundJobStateChanger((IStateMachine)null));
+                () => new BackgroundJobStateChanger(_filterProvider.Object, null));
 
             Assert.Equal("stateMachine", exception.ParamName);
         }
@@ -311,9 +326,52 @@ namespace Hangfire.Core.Tests.States
             Assert.Same(result, anotherState.Object);
         }
 
+        [Fact]
+        public void ChangeState_RethrowsFilterException_AndDoesNotCommitAnything_WhenNoCancellationToken()
+        {
+            // Arrange
+            _stateMachine
+                .Setup(x => x.ApplyState(It.Is<ApplyStateContext>(context => context.NewState == _state.Object)))
+                .Throws<Exception>();
+
+            var stateChanger = CreateStateChanger();
+
+            // Act & Assert
+            Assert.Throws<Exception>(() => stateChanger.ChangeState(_context.Object));
+
+            _transaction.Verify(x => x.Commit(), Times.Never);
+
+            _stateMachine.Verify(
+                x => x.ApplyState(It.Is<ApplyStateContext>(context => context.NewState == _state.Object)),
+                Times.Once);
+        }
+
+        [Fact]
+        public void ChangeState_SimplyRethrowsAnException_WithoutRetriesAndFailedState()
+        {
+            // Arrange
+            _stateMachine
+                .Setup(x => x.ApplyState(It.Is<ApplyStateContext>(context => context.NewState == _state.Object)))
+                .Throws<Exception>();
+
+            var stateChanger = CreateStateChanger();
+
+            // Act & Assert
+            Assert.Throws<Exception>(() => stateChanger.ChangeState(_context.Object));
+
+            _connection.Verify(x => x.GetJobData(JobId), Times.Once);
+            _connection.Verify(x => x.AcquireDistributedLock($"job:{JobId}:state-lock", It.IsAny<TimeSpan>()), Times.Once);
+
+            _transaction.Verify(x => x.Commit(), Times.Never);
+
+            _stateMachine.Verify(
+                x => x.ApplyState(It.Is<ApplyStateContext>(context => context.NewState == _state.Object)),
+                Times.Once);
+        }
+
         private BackgroundJobStateChanger CreateStateChanger()
         {
-            return new BackgroundJobStateChanger(_stateMachine.Object);
+            return new BackgroundJobStateChanger(_filterProvider.Object, _stateMachine.Object);
         }
     }
 }

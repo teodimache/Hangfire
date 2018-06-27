@@ -16,25 +16,28 @@
 
 using System;
 using System.Collections.Generic;
-using System.Configuration;
 using System.Data;
+using System.Data.Common;
 using System.Data.SqlClient;
 using System.Linq;
 using System.Text;
+#if NETFULL
+using System.Configuration;
 using System.Transactions;
+using IsolationLevel = System.Transactions.IsolationLevel;
+#endif
 using Dapper;
 using Hangfire.Annotations;
 using Hangfire.Dashboard;
 using Hangfire.Logging;
 using Hangfire.Server;
 using Hangfire.Storage;
-using IsolationLevel = System.Transactions.IsolationLevel;
 
 namespace Hangfire.SqlServer
 {
     public class SqlServerStorage : JobStorage
     {
-        private readonly SqlConnection _existingConnection;
+        private readonly DbConnection _existingConnection;
         private readonly SqlServerStorageOptions _options;
         private readonly string _connectionString;
 
@@ -57,54 +60,47 @@ namespace Hangfire.SqlServer
         /// config file.</exception>
         public SqlServerStorage(string nameOrConnectionString, SqlServerStorageOptions options)
         {
-            if (nameOrConnectionString == null) throw new ArgumentNullException("nameOrConnectionString");
-            if (options == null) throw new ArgumentNullException("options");
+            if (nameOrConnectionString == null) throw new ArgumentNullException(nameof(nameOrConnectionString));
+            if (options == null) throw new ArgumentNullException(nameof(options));
 
+            _connectionString = GetConnectionString(nameOrConnectionString);
             _options = options;
 
-            if (IsConnectionString(nameOrConnectionString))
-            {
-                _connectionString = nameOrConnectionString;
-            }
-            else if (IsConnectionStringInConfiguration(nameOrConnectionString))
-            {
-                _connectionString = ConfigurationManager.ConnectionStrings[nameOrConnectionString].ConnectionString;
-            }
-            else
-            {
-                throw new ArgumentException(
-                    string.Format("Could not find connection string with name '{0}' in application config file",
-                                  nameOrConnectionString));
-            }
-
-            if (options.PrepareSchemaIfNecessary)
-            {
-                using (var connection = CreateAndOpenConnection())
-                {
-                    SqlServerObjectsInstaller.Install(connection, options.SchemaName);
-                }
-            }
-
-            InitializeQueueProviders();
+            Initialize();
         }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="SqlServerStorage"/> class with
-        /// explicit instance of the <see cref="SqlConnection"/> class that will be used
+        /// explicit instance of the <see cref="DbConnection"/> class that will be used
         /// to query the data.
         /// </summary>
-        /// <param name="existingConnection">Existing connection</param>
-        public SqlServerStorage([NotNull] SqlConnection existingConnection)
+        public SqlServerStorage([NotNull] DbConnection existingConnection)
+            : this(existingConnection, new SqlServerStorageOptions())
         {
-            if (existingConnection == null) throw new ArgumentNullException("existingConnection");
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SqlServerStorage"/> class with
+        /// explicit instance of the <see cref="DbConnection"/> class that will be used
+        /// to query the data, with the given options.
+        /// </summary>
+        public SqlServerStorage([NotNull] DbConnection existingConnection, [NotNull] SqlServerStorageOptions options)
+        {
+            if (existingConnection == null) throw new ArgumentNullException(nameof(existingConnection));
+            if (options == null) throw new ArgumentNullException(nameof(options));
 
             _existingConnection = existingConnection;
-            _options = new SqlServerStorageOptions();
+            _options = options;
 
-            InitializeQueueProviders();
+            Initialize();
         }
 
         public virtual PersistentJobQueueProviderCollection QueueProviders { get; private set; }
+
+        internal string SchemaName => _options.SchemaName;
+        internal int? CommandTimeout => _options.CommandTimeout.HasValue ? (int)_options.CommandTimeout.Value.TotalSeconds : (int?)null;
+        internal int? CommandBatchMaxTimeout => _options.CommandBatchMaxTimeout.HasValue ? (int)_options.CommandBatchMaxTimeout.Value.TotalSeconds : (int?)null;
+        internal TimeSpan? SlidingInvisibilityTimeout => _options.SlidingInvisibilityTimeout;
 
         public override IMonitoringApi GetMonitoringApi()
         {
@@ -116,7 +112,9 @@ namespace Hangfire.SqlServer
             return new SqlServerConnection(this);
         }
 
+#pragma warning disable 618
         public override IEnumerable<IServerComponent> GetComponents()
+#pragma warning restore 618
         {
             yield return new ExpirationManager(this, _options.JobExpirationCheckInterval);
             yield return new CountersAggregator(this, _options.CountersAggregateInterval);
@@ -125,7 +123,7 @@ namespace Hangfire.SqlServer
         public override void WriteOptionsToLog(ILog logger)
         {
             logger.Info("Using the following options for SQL Server job storage:");
-            logger.InfoFormat("    Queue poll interval: {0}.", _options.QueuePollInterval);
+            logger.Info($"    Queue poll interval: {_options.QueuePollInterval}.");
         }
 
         public override string ToString()
@@ -162,7 +160,7 @@ namespace Hangfire.SqlServer
                 }
 
                 return builder.Length != 0
-                    ? String.Format("SQL Server: {0}", builder)
+                    ? $"SQL Server: {builder}"
                     : canNotParseMessage;
             }
             catch (Exception)
@@ -171,82 +169,110 @@ namespace Hangfire.SqlServer
             }
         }
 
-        internal void UseConnection([InstantHandle] Action<SqlConnection> action)
+        internal void UseConnection(DbConnection dedicatedConnection, [InstantHandle] Action<DbConnection> action)
         {
-            UseConnection(connection =>
+            UseConnection(dedicatedConnection, connection =>
             {
                 action(connection);
                 return true;
             });
         }
 
-        internal T UseConnection<T>([InstantHandle] Func<SqlConnection, T> func)
+        internal T UseConnection<T>(DbConnection dedicatedConnection, [InstantHandle] Func<DbConnection, T> func)
         {
-            SqlConnection connection = null;
+            DbConnection connection = null;
 
             try
             {
-                connection = CreateAndOpenConnection();
+                connection = dedicatedConnection ?? CreateAndOpenConnection();
                 return func(connection);
             }
             finally
             {
-                ReleaseConnection(connection);
+                if (dedicatedConnection == null)
+                {
+                    ReleaseConnection(connection);
+                }
             }
         }
 
-        internal void UseTransaction([InstantHandle] Action<SqlConnection> action)
+        internal void UseTransaction(DbConnection dedicatedConnection, [InstantHandle] Action<DbConnection, DbTransaction> action)
         {
-            UseTransaction(connection =>
+            UseTransaction(dedicatedConnection, (connection, transaction) =>
             {
-                action(connection);
+                action(connection, transaction);
                 return true;
             }, null);
         }
-
-        internal T UseTransaction<T>([InstantHandle] Func<SqlConnection, T> func, IsolationLevel? isolationLevel)
+        
+        internal T UseTransaction<T>(
+            DbConnection dedicatedConnection,
+            [InstantHandle] Func<DbConnection, DbTransaction, T> func, 
+            IsolationLevel? isolationLevel)
         {
+#if NETFULL
             using (var transaction = CreateTransaction(isolationLevel ?? _options.TransactionIsolationLevel))
             {
-                var result = UseConnection(func);
+                var result = UseConnection(dedicatedConnection, connection =>
+                {
+                    connection.EnlistTransaction(Transaction.Current);
+                    return func(connection, null);
+                });
+
                 transaction.Complete();
 
                 return result;
             }
+#else
+            return UseConnection(dedicatedConnection, connection =>
+            {
+                using (var transaction = connection.BeginTransaction(isolationLevel ?? IsolationLevel.ReadCommitted))
+                {
+                    var result = func(connection, transaction);
+                    transaction.Commit();
+
+                    return result;
+                }
+            });
+#endif
         }
 
-        internal SqlConnection CreateAndOpenConnection()
+        internal DbConnection CreateAndOpenConnection()
         {
-            if (_existingConnection != null)
-            {
-                return _existingConnection;
-            }
+            var connection = _existingConnection ?? new SqlConnection(_connectionString);
 
-            var connection = new SqlConnection(_connectionString);
-            connection.Open();
+            if (connection.State == ConnectionState.Closed)
+            {
+                connection.Open();
+            }
 
             return connection;
         }
 
+        internal bool IsExistingConnection(IDbConnection connection)
+        {
+            return connection != null && ReferenceEquals(connection, _existingConnection);
+        }
+
         internal void ReleaseConnection(IDbConnection connection)
         {
-            if (connection != null && !ReferenceEquals(connection, _existingConnection))
+            if (connection != null && !IsExistingConnection(connection))
             {
                 connection.Dispose();
             }
         }
 
-        internal string GetSchemaName()
+        private void Initialize()
         {
-            return _options.SchemaName;
-        }
+            if (_options.PrepareSchemaIfNecessary)
+            {
+                UseConnection(null, connection =>
+                {
+                    SqlServerObjectsInstaller.Install(connection, _options.SchemaName);
+                });
+            }
 
-        private TransactionScope CreateTransaction(IsolationLevel? isolationLevel)
-        {
-            return isolationLevel != null
-                ? new TransactionScope(TransactionScopeOption.Required,
-                    new TransactionOptions { IsolationLevel = isolationLevel.Value, Timeout = _options.TransactionTimeout })
-                : new TransactionScope();
+            InitializeQueueProviders();
         }
 
         private void InitializeQueueProviders()
@@ -255,6 +281,27 @@ namespace Hangfire.SqlServer
             QueueProviders = new PersistentJobQueueProviderCollection(defaultQueueProvider);
         }
 
+        private string GetConnectionString(string nameOrConnectionString)
+        {
+#if NETFULL
+            if (IsConnectionString(nameOrConnectionString))
+            {
+                return nameOrConnectionString;
+            }
+
+            if (IsConnectionStringInConfiguration(nameOrConnectionString))
+            {
+                return ConfigurationManager.ConnectionStrings[nameOrConnectionString].ConnectionString;
+            }
+
+            throw new ArgumentException(
+                $"Could not find connection string with name '{nameOrConnectionString}' in application config file");
+#else
+            return nameOrConnectionString;
+#endif
+        }
+
+#if NETFULL
         private bool IsConnectionString(string nameOrConnectionString)
         {
             return nameOrConnectionString.Contains(";");
@@ -267,15 +314,24 @@ namespace Hangfire.SqlServer
             return connectionStringSetting != null;
         }
 
+        private TransactionScope CreateTransaction(IsolationLevel? isolationLevel)
+        {
+            return isolationLevel != null
+                ? new TransactionScope(TransactionScopeOption.Required,
+                    new TransactionOptions { IsolationLevel = isolationLevel.Value, Timeout = _options.TransactionTimeout })
+                : new TransactionScope();
+        }
+#endif
+
         public static readonly DashboardMetric ActiveConnections = new DashboardMetric(
             "connections:active",
-            "Active Connections",
+            "Metrics_ActiveConnections",
             page =>
             {
                 var sqlStorage = page.Storage as SqlServerStorage;
                 if (sqlStorage == null) return new Metric("???");
 
-                return sqlStorage.UseConnection(connection =>
+                return sqlStorage.UseConnection(null, connection =>
                 {
                     var sqlQuery = @"
 select count(*) from sys.sysprocesses
@@ -285,19 +341,19 @@ where dbid = db_id(@name) and status != 'background' and status != 'sleeping'";
                         .Query<int>(sqlQuery, new { name = connection.Database })
                         .Single();
 
-                    return new Metric(value.ToString("N0"));
+                    return new Metric(value);
                 });
             });
 
         public static readonly DashboardMetric TotalConnections = new DashboardMetric(
             "connections:total",
-            "Total Connections",
+            "Metrics_TotalConnections",
             page =>
             {
                 var sqlStorage = page.Storage as SqlServerStorage;
                 if (sqlStorage == null) return new Metric("???");
 
-                return sqlStorage.UseConnection(connection =>
+                return sqlStorage.UseConnection(null, connection =>
                 {
                     var sqlQuery = @"
 select count(*) from sys.sysprocesses
@@ -307,7 +363,7 @@ where dbid = db_id(@name) and status != 'background'";
                         .Query<int>(sqlQuery, new { name = connection.Database })
                         .Single();
 
-                    return new Metric(value.ToString("N0"));
+                    return new Metric(value);
                 });
             });
     }

@@ -28,10 +28,11 @@ namespace Hangfire
 {
     public class ContinuationsSupportAttribute : JobFilterAttribute, IElectStateFilter, IApplyStateFilter
     {
-        private static readonly TimeSpan AddJobLockTimeout = TimeSpan.FromSeconds(1);
-        private static readonly TimeSpan ContinuationStateFetchTimeout = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan AddJobLockTimeout = TimeSpan.FromMinutes(1);
+        private static readonly TimeSpan ContinuationStateFetchTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan ContinuationInvalidTimeout = TimeSpan.FromMinutes(15);
 
-        private static readonly ILog Logger = LogProvider.GetCurrentClassLogger();
+        private static readonly ILog Logger = LogProvider.For<ContinuationsSupportAttribute>();
 
         private readonly HashSet<string> _knownFinalStates;
         private readonly IBackgroundJobStateChanger _stateChanger;
@@ -50,8 +51,8 @@ namespace Hangfire
             [NotNull] HashSet<string> knownFinalStates, 
             [NotNull] IBackgroundJobStateChanger stateChanger)
         {
-            if (knownFinalStates == null) throw new ArgumentNullException("knownFinalStates");
-            if (stateChanger == null) throw new ArgumentNullException("stateChanger");
+            if (knownFinalStates == null) throw new ArgumentNullException(nameof(knownFinalStates));
+            if (stateChanger == null) throw new ArgumentNullException(nameof(stateChanger));
 
             _knownFinalStates = knownFinalStates;
             _stateChanger = stateChanger;
@@ -97,7 +98,19 @@ namespace Hangfire
             using (connection.AcquireDistributedJobLock(parentId, AddJobLockTimeout))
             {
                 var continuations = GetContinuations(connection, parentId);
-                continuations.Add(new Continuation { JobId = context.BackgroundJob.Id, Options = awaitingState.Options });
+
+                // Continuation may be already added. This may happen, when outer transaction
+                // was failed after adding a continuation last time, since the addition is
+                // performed outside of an outer transaction.
+                if (!continuations.Exists(x => x.JobId == context.BackgroundJob.Id))
+                {
+                    continuations.Add(new Continuation { JobId = context.BackgroundJob.Id, Options = awaitingState.Options });
+
+                    // Set continuation only after ensuring that parent job still
+                    // exists. Otherwise we could create add non-expiring (garbage)
+                    // parameter for the parent job.
+                    SetContinuations(connection, parentId, continuations);
+                }
 
                 var jobData = connection.GetJobData(parentId);
                 if (jobData == null)
@@ -106,15 +119,10 @@ namespace Hangfire
                     // the system should throw an exception instead of creating
                     // corrupted state.
                     throw new InvalidOperationException(
-                        String.Format("Can not add a continuation: parent background job '{0}' does not exist.", parentId));
+                        $"Can not add a continuation: parent background job '{parentId}' does not exist.");
                 }
 
                 var currentState = connection.GetStateData(parentId);
-
-                // Set continuation only after ensuring that parent job still
-                // exists. Otherwise we could create add non-expiring (garbage)
-                // parameter for the parent job.
-                SetContinuations(connection, parentId, continuations);
 
                 if (currentState != null && _knownFinalStates.Contains(currentState.Name))
                 {
@@ -151,30 +159,37 @@ namespace Hangfire
                 // the state of a continuation, we should simply skip it.
                 if (currentState.Name != AwaitingState.StateName) continue;
 
+                IState nextState;
+
                 if (continuation.Options.HasFlag(JobContinuationOptions.OnlyOnSucceededState) &&
                     context.CandidateState.Name != SucceededState.StateName)
                 {
-                    nextStates.Add(continuation.JobId, new DeletedState { Reason = "Continuation condition was not met" });
-                    continue;
+                    nextState = new DeletedState { Reason = "Continuation condition was not met" };
                 }
-
-                IState nextState;
-
-                try
+                else
                 {
-                    nextState = JsonConvert.DeserializeObject<IState>(
-                        currentState.Data["NextState"],
-                        new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.Objects });
-                }
-                catch (Exception ex)
-                {
-                    nextState = new FailedState(ex)
+                    try
                     {
-                        Reason = "An error occurred while deserializing the continuation"
-                    };
+                        nextState = JsonConvert.DeserializeObject<IState>(
+                            currentState.Data["NextState"],
+                            new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.Objects });
+                    }
+                    catch (Exception ex)
+                    {
+                        nextState = new FailedState(ex)
+                        {
+                            Reason = "An error occurred while deserializing the continuation"
+                        };
+                    }
                 }
 
-                nextStates.Add(continuation.JobId, nextState);
+                if (!nextStates.ContainsKey(continuation.JobId))
+                {
+                    // Duplicate continuations possible, when they were added before version 1.6.10.
+                    // Please see details in comments for the AddContinuation method near the line
+                    // with checking for existence (continuations.Exists).
+                    nextStates.Add(continuation.JobId, nextState);
+                }
             }
             
             foreach (var tuple in nextStates)
@@ -200,10 +215,8 @@ namespace Hangfire
                 var continuationData = context.Connection.GetJobData(continuationJobId);
                 if (continuationData == null)
                 {
-                    Logger.Warn(String.Format(
-                        "Can not start continuation '{0}' for background job '{1}': continuation does not exist.",
-                        continuationJobId,
-                        context.BackgroundJob.Id));
+                    Logger.Warn(
+                        $"Can not start continuation '{continuationJobId}' for background job '{context.BackgroundJob.Id}': continuation does not exist.");
 
                     break;
                 }
@@ -214,12 +227,18 @@ namespace Hangfire
                     break;
                 }
 
+                if (DateTime.UtcNow - continuationData.CreatedAt > ContinuationInvalidTimeout)
+                {
+                    Logger.Warn(
+                        $"Continuation '{continuationJobId}' has been ignored: it was deemed to be aborted, because its state is still non-initialized.");
+
+                    break;
+                }
+
                 if (DateTime.UtcNow >= started.Add(timeout))
                 {
-                    throw new TimeoutException(String.Format(
-                        "Can not start continuation '{0}' for background job '{1}': timeout expired while trying to fetch continuation state.",
-                        continuationJobId,
-                        context.BackgroundJob.Id));
+                    throw new TimeoutException(
+                        $"Can not start continuation '{continuationJobId}' for background job '{context.BackgroundJob.Id}': timeout expired while trying to fetch continuation state.");
                 }
 
                 Thread.Sleep(firstAttempt ? 0 : 1);
@@ -245,7 +264,7 @@ namespace Hangfire
         {
         }
 
-        private struct Continuation
+        internal struct Continuation
         {
             public string JobId { get; set; }
             public JobContinuationOptions Options { get; set; }

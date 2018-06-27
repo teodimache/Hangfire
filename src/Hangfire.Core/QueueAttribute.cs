@@ -55,12 +55,13 @@ namespace Hangfire
         public QueueAttribute(string queue)
         {
             Queue = queue;
+            Order = Int32.MaxValue;
         }
 
         /// <summary>
         /// Gets the queue name that will be used for background jobs.
         /// </summary>
-        public string Queue { get; private set; }
+        public string Queue { get; }
 
         public void OnStateElection(ElectStateContext context)
         {
